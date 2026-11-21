@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .data import element_table
+
 
 def rbf(x: torch.Tensor, lo: float, hi: float, n: int) -> torch.Tensor:
     centres = torch.linspace(lo, hi, n, device=x.device)
@@ -32,6 +34,8 @@ class ALIGNN(nn.Module):
         super().__init__()
         self.n_rbf, self.cutoff = n_rbf, cutoff
         self.atom = nn.Embedding(119, hidden)
+        self.register_buffer("props", torch.from_numpy(element_table()))
+        self.prop_proj = nn.Linear(self.props.shape[1], hidden)
         self.bond, self.angle = (nn.Sequential(nn.Linear(n_rbf, hidden), nn.SiLU()) for _ in range(2))
         self.alignn = nn.ModuleList(nn.ModuleList([EdgeGatedConv(hidden), EdgeGatedConv(hidden)])
                                     for _ in range(n_alignn))
@@ -41,7 +45,7 @@ class ALIGNN(nn.Module):
         self.register_buffer("y_std", torch.ones(()))
 
     def forward(self, g: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.atom(g["z"])
+        x = self.atom(g["z"]) + self.prop_proj(self.props[g["z"]])
         y = self.bond(rbf(g["dist"], 0, self.cutoff, self.n_rbf))
         z = self.angle(rbf(g["cos"], -1, 1, self.n_rbf))
         for line_conv, atom_conv in self.alignn:

@@ -26,6 +26,11 @@ def test_perovskite_check():
     ilmenite = Structure.from_spacegroup("R-3", Lattice.hexagonal(5.088, 14.09), ["Fe", "Ti", "O"],
                                          [[0, 0, 0.3554], [0, 0, 0.1464], [0.317, 0.020, 0.2464]])
     assert not data.is_perovskite(ilmenite, ["O"])
+    double = Structure(Lattice.cubic(3.95), ["Ba", "Fe", "O", "O", "O"], data.CUBIC).make_supercell([2, 2, 2])
+    for i in [i for i, site in enumerate(double) if site.specie.symbol == "Fe"
+              and np.floor(site.frac_coords * 2 + 1e-6).astype(int).sum() % 2]:
+        double.replace(i, "Mo")
+    assert double.composition.reduced_formula == "Ba2FeMoO6" and data.is_perovskite(double, ["O"])
 
 
 def test_prediction_is_invariant_to_rotation_and_atom_order():
@@ -42,12 +47,13 @@ def test_prediction_is_invariant_to_rotation_and_atom_order():
 
 def test_fetch_train_predict_end_to_end(tmp_path, capsys):
     sets = ["--config", str(CONFIG), "--set", "data.source=synthetic", f"data.table={tmp_path}/t.parquet",
-            f"data.graphs={tmp_path}/g.pt", f"out={tmp_path}/run", "train.epochs=3", "train.label_fraction=0.5",
+            f"data.graphs={tmp_path}/g.pt", f"out={tmp_path}/run", "train.epochs=3", "train.seeds=[0,1]",
+            "train.label_fraction=0.5",
             "model.hidden=16"]
     main(["fetch", *sets])
     main(["train", *sets])
     report = (tmp_path / "run" / "report.txt").read_text()
-    assert "test MAE" in report and "nan" not in report.split("test MAE")[1].split("\n")[0]
+    assert "MAE median guess" in report and "nan" not in report.split("\nMAE ")[1].split("\n")[0]
     main(["train", *sets, "graph.k=6"])
     assert torch.load(tmp_path / "g.pt", weights_only=True)["settings"]["k"] == 6
     SRTIO3.to(filename=str(tmp_path / "SrTiO3.cif"))
@@ -55,4 +61,4 @@ def test_fetch_train_predict_end_to_end(tmp_path, capsys):
     capsys.readouterr()
     main(["predict", str(tmp_path / "SrTiO3.cif"), str(tmp_path / "broken.cif"), *sets])
     out = capsys.readouterr().out
-    assert "SrTiO3.cif: SrTiO3  E_hull" in out and "broken.cif: skipped" in out
+    assert "SrTiO3.cif: SrTiO3  E_hull" in out and " ± " in out and "broken.cif: skipped" in out

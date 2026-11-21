@@ -1,5 +1,6 @@
 import json
 import os
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -10,15 +11,15 @@ PROPS = ("Z", "X", "atomic_radius", "row", "group")
 CUBIC = [[0, 0, 0], [0.5, 0.5, 0.5], [0.5, 0.5, 0], [0.5, 0, 0.5], [0, 0.5, 0.5]]
 
 
-def fetch(n_max: int, anions: list[str], max_sites: int = 60) -> pd.DataFrame:
+def fetch(n_max: int, anions: list[str], patterns: list[str], max_sites: int = 60) -> pd.DataFrame:
     from mp_api.client import MPRester
 
     load_dotenv()
     if not (key := os.getenv("MP_API_KEY", "").strip()):
         raise SystemExit("no API key: put MP_API_KEY=<your key> in a .env file (see .env.example)")
     with MPRester(key, mute_progress_bars=True) as mpr:
-        docs = [d for x in anions for d in mpr.materials.summary.search(
-            formula="ABC3", elements=[x], deprecated=False, num_sites=(1, max_sites), include_gnome=False,
+        docs = [d for f in patterns for x in anions for d in mpr.materials.summary.search(
+            formula=f, elements=[x], deprecated=False, num_sites=(1, max_sites), include_gnome=False,
             fields=["material_id", "formula_pretty", "structure", "energy_above_hull"])]
     df = pd.DataFrame([{"material_id": str(d.material_id), "formula": d.formula_pretty, "e_hull": d.energy_above_hull,
                         "structure": json.dumps(d.structure.as_dict())}
@@ -28,8 +29,7 @@ def fetch(n_max: int, anions: list[str], max_sites: int = 60) -> pd.DataFrame:
 
 def is_perovskite(s: Structure, anions: list[str], b_tol: float = 0.25, a_tol: float = 0.4) -> bool:
     comp = s.composition.reduced_composition
-    xs = [e.symbol for e in comp if e.symbol in anions]
-    if len(comp) != 3 or len(xs) != 1 or comp[xs[0]] != 3:
+    if len(xs := [e.symbol for e in comp if e.symbol in anions]) != 1:
         return False
     ratios = {}
     for site in s:
@@ -38,7 +38,9 @@ def is_perovskite(s: Structure, anions: list[str], b_tol: float = 0.25, a_tol: f
             ratios.setdefault(el, []).append(d / d.min() if len(d) else np.array([np.inf]))
     b = [el for el, rs in ratios.items() if all((r <= 1 + b_tol).sum() == 6 for r in rs)]
     a = [el for el in ratios if el not in b]
-    return len(b) == 1 and len(a) == 1 and all((r <= 1 + a_tol).sum() >= 8 for r in ratios[a[0]])
+    n_b, n_a = sum(comp[e] for e in b), sum(comp[e] for e in a)
+    return (bool(a) and np.isclose(n_b, comp[xs[0]] / 3) and np.isclose(n_a, n_b)
+            and all((r <= 1 + a_tol).sum() >= 8 for e in a for r in ratios[e]))
 
 
 def composition_features(formula: str) -> np.ndarray:
@@ -47,6 +49,14 @@ def composition_features(formula: str) -> np.ndarray:
     w = np.array([comp[e] for e in comp.elements])[:, None]
     mean = (w * P).sum(0)
     return np.concatenate([mean, np.sqrt((w * (P - mean) ** 2).sum(0))])
+
+
+def element_table() -> np.ndarray:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        P = np.array([[float(getattr(Element.from_Z(z), p) or np.nan) for p in PROPS] for z in range(1, 119)])
+    P = np.nan_to_num((P - np.nanmean(P, 0)) / np.nanstd(P, 0))
+    return np.vstack([np.zeros(len(PROPS)), P]).astype(np.float32)
 
 
 def synthetic(n: int = 120, seed: int = 0) -> pd.DataFrame:
@@ -66,7 +76,8 @@ def synthetic(n: int = 120, seed: int = 0) -> pd.DataFrame:
 
 def prepare(cfg: dict) -> pd.DataFrame:
     d = cfg["data"]
-    df = synthetic() if d["source"] == "synthetic" else fetch(d["max_materials"], d["anions"], d["max_sites"])
+    df = synthetic() if d["source"] == "synthetic" else fetch(d["max_materials"], d["anions"], d["patterns"],
+                                                                         d["max_sites"])
     df["is_perovskite"] = [is_perovskite(Structure.from_dict(json.loads(s)), d["anions"]) for s in df.structure]
     os.makedirs(os.path.dirname(d["table"]) or ".", exist_ok=True)
     df.to_parquet(d["table"], index=False)

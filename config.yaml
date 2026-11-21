@@ -5,10 +5,12 @@ data:
   max_materials: 1000
   anions: [O, F, Cl, Br, I, S, Se, N]
   max_sites: 60
+  patterns: [ABC3, ABC2D6]
+  workers: 4
 graph: {k: 12, cutoff: 8.0}
 model: {hidden: 64, n_alignn: 2, n_gcn: 2, n_rbf: 40}
 train:
-  seed: 0
+  seeds: [0, 1, 2]
   device: cpu
   epochs: 100
   batch_size: 32

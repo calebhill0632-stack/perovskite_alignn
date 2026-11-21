@@ -1,5 +1,7 @@
 import argparse
 import json
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
 
 import numpy as np
@@ -38,13 +40,21 @@ def split(df: pd.DataFrame, seed: int, fractions=(0.8, 0.1)) -> pd.Series:
     return df.formula.map(part)
 
 
+def _build(args: tuple[str, dict]) -> dict:
+    return graph.build(Structure.from_dict(json.loads(args[0])), **args[1])
+
+
 def graphs_for(df: pd.DataFrame, cfg: dict) -> dict:
     path, settings = Path(cfg["data"]["graphs"]), cfg["graph"]
     cache = torch.load(path, weights_only=True) if path.exists() else {}
     graphs = cache.get("graphs", {}) if cache.get("settings") == settings else {}
-    if missing := [m for m in df.material_id if m not in graphs]:
-        s = dict(zip(df.material_id, df.structure))
-        graphs |= {m: graph.build(Structure.from_dict(json.loads(s[m])), **settings) for m in missing}
+    if not (missing := df[~df.material_id.isin(graphs)]).empty:
+        items, workers = [(s, settings) for s in missing.structure], cfg["data"].get("workers", 1)
+        if workers > 1 and len(items) > 100:
+            with ProcessPoolExecutor(workers, mp_context=get_context("spawn")) as pool:
+                graphs |= dict(zip(missing.material_id, pool.map(_build, items, chunksize=16)))
+        else:
+            graphs |= dict(zip(missing.material_id, map(_build, items)))
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"settings": settings, "graphs": graphs}, path)
     return graphs
@@ -70,23 +80,24 @@ def ssl_loss(model: ALIGNN, pool: list[dict], nbrs: np.ndarray, w: np.ndarray, r
     return (torch.as_tensor(w[a, j], dtype=z.dtype, device=device) * ((z[:n] - z[n:]) ** 2).sum(-1)).mean()
 
 
-def metrics(p: np.ndarray, y: np.ndarray) -> dict:
+def metrics(p: np.ndarray, y: np.ndarray, y_train: np.ndarray) -> dict:
     stable = y <= STABLE
-    return {"MAE": np.mean(np.abs(p - y)), "RMSE": np.sqrt(np.mean((p - y) ** 2)),
+    return {"MAE": np.mean(np.abs(p - y)), "MAE median guess": np.mean(np.abs(np.median(y_train) - y)),
+            "RMSE": np.sqrt(np.mean((p - y) ** 2)),
             "R2": 1 - np.sum((p - y) ** 2) / max(np.sum((y - y.mean()) ** 2), 1e-12),
             "Spearman": spearmanr(y, p).statistic if len(y) > 2 else np.nan,
             f"AUC stable <= {STABLE}": roc_auc_score(stable, -p) if 0 < stable.sum() < len(y) else np.nan}
 
 
-def train(cfg: dict) -> str:
-    t, out, dev = cfg["train"], Path(cfg["out"]), cfg["train"].get("device", "cpu")
-    df = pd.read_parquet(cfg["data"]["table"]).query("is_perovskite & e_hull.notna()").reset_index(drop=True)
-    torch.manual_seed(t["seed"])
-    rng, gs = np.random.default_rng(t["seed"]), graphs_for(df, cfg)
-    df["set"] = split(df, t["seed"])
-    tr = df[df.set == "train"].sample(frac=1, random_state=t["seed"])
+def train_seed(cfg: dict, df: pd.DataFrame, gs: dict, seed: int) -> tuple[ALIGNN, pd.DataFrame, dict]:
+    t, dev = cfg["train"], cfg["train"].get("device", "cpu")
+    torch.manual_seed(seed)
+    rng, part = np.random.default_rng(seed), split(df, seed)
+    tr = df[part == "train"].sample(frac=1, random_state=seed)
     lab = tr.head(max(1, round(t["label_fraction"] * len(tr))))
-    val, test = df[df.set == "val"], df[df.set == "test"]
+    val, test = df[part == "val"], df[part == "test"]
+    if val.empty or test.empty:
+        raise SystemExit(f"only {len(df)} perovskites with labels: too few for validation and test sets")
     model = ALIGNN(**cfg["model"], cutoff=cfg["graph"]["cutoff"]).to(dev)
     model.y_mean.fill_(lab.e_hull.mean())
     model.y_std.fill_(max(lab.e_hull.std(), 1e-3) if len(lab) > 1 else 1.0)
@@ -116,26 +127,38 @@ def train(cfg: dict) -> str:
         if val_mae < best:
             best, best_epoch, best_state = val_mae, epoch, {k: v.clone() for k, v in model.state_dict().items()}
         if epoch % 10 == 0:
-            print(f"epoch {epoch:3d}  val MAE {val_mae:.4f}  best {best:.4f}", flush=True)
+            print(f"seed {seed}  epoch {epoch:3d}  val MAE {val_mae:.4f}  best {best:.4f}", flush=True)
         if epoch - best_epoch >= t["patience"]:
             break
     model.load_state_dict(best_state)
-    out.mkdir(parents=True, exist_ok=True)
-    torch.save({"state": model.state_dict(), "model": cfg["model"], "graph": cfg["graph"]}, out / "model.pt")
     p = predict(model, [gs[m] for m in test.material_id], dev)
-    test.assign(pred_ehull=p)[["material_id", "formula", "e_hull", "pred_ehull"]].to_csv(
-        out / "test_predictions.csv", index=False)
-    lines = [f"ALIGNN + graph-Laplacian SSL (weight {t['ssl_weight']}): {len(lab)} labeled of {len(tr)} training, "
-             f"{len(val)} validation, {len(test)} test materials; best epoch {best_epoch}, validation MAE {best:.4f}",
-             *(f"test {name:<18} {v:.4f}" for name, v in metrics(p, test.e_hull.values).items())]
+    info = {"labeled": len(lab), "training": len(tr), "best epoch": best_epoch, "val MAE": best,
+            **metrics(p, test.e_hull.values, lab.e_hull.values)}
+    return model, test.assign(seed=seed, pred_ehull=p)[["seed", "material_id", "formula", "e_hull", "pred_ehull"]], info
+
+
+def train(cfg: dict) -> str:
+    t, out = cfg["train"], Path(cfg["out"])
+    df = pd.read_parquet(cfg["data"]["table"]).query("is_perovskite & e_hull.notna()").reset_index(drop=True)
+    gs = graphs_for(df, cfg)
+    runs = [train_seed(cfg, df, gs, seed) for seed in t["seeds"]]
+    out.mkdir(parents=True, exist_ok=True)
+    torch.save({"states": [m.cpu().state_dict() for m, _, _ in runs], "model": cfg["model"], "graph": cfg["graph"]},
+               out / "model.pt")
+    pd.concat([r[1] for r in runs]).to_csv(out / "test_predictions.csv", index=False)
+    info = pd.DataFrame([r[2] for r in runs])
+    lines = [f"ALIGNN + graph-Laplacian SSL (weight {t['ssl_weight']}), {len(df)} perovskites, seeds {t['seeds']}, "
+             "mean ± sd over seeds (eV/atom for errors)",
+             *(f"{name:<24} {v.mean():.4f} ± {v.std(ddof=0):.4f}" for name, v in info.items())]
     (out / "report.txt").write_text(text := "\n".join(lines) + "\n")
     return text
 
 
 def predict_files(cfg: dict, inputs: list[str]) -> str:
     ck = torch.load(Path(cfg["out"]) / "model.pt", weights_only=True)
-    model = ALIGNN(**ck["model"], cutoff=ck["graph"]["cutoff"])
-    model.load_state_dict(ck["state"])
+    models = [ALIGNN(**ck["model"], cutoff=ck["graph"]["cutoff"]) for _ in ck["states"]]
+    for m, state in zip(models, ck["states"]):
+        m.load_state_dict(state)
     structs, lines = [], []
     for f in (f for i in map(Path, inputs) for f in (sorted(i.glob("*.cif")) if i.is_dir() else [i])):
         try:
@@ -144,11 +167,12 @@ def predict_files(cfg: dict, inputs: list[str]) -> str:
             lines.append(f"{f.name}: skipped ({type(e).__name__}: {e})")
     if not structs:
         raise SystemExit("\n".join(lines + ["no readable CIF files given"]))
-    p = predict(model, [graph.build(s, **ck["graph"]) for _, s in structs])
-    return "\n".join(lines + [f"{name}: {s.composition.reduced_formula}  E_hull {e:.3f} eV/atom -> "
+    gs = [graph.build(s, **ck["graph"]) for _, s in structs]
+    P = np.stack([predict(m, gs) for m in models])
+    return "\n".join(lines + [f"{name}: {s.composition.reduced_formula}  E_hull {e:.3f} ± {sd:.3f} eV/atom -> "
                               f"{'stable or metastable' if e <= STABLE else 'unstable'}"
                               + ("" if data.is_perovskite(s, cfg["data"]["anions"]) else "  (not a perovskite)")
-                              for (name, s), e in zip(structs, p)])
+                              for (name, s), e, sd in zip(structs, P.mean(0), P.std(0))])
 
 
 def main(argv: list[str] | None = None) -> None:
