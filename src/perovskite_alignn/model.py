@@ -1,12 +1,9 @@
-"""ALIGNN-style network: edge-gated graph convolutions alternating on the line graph (bonds and angles) and the
-atom graph (atoms and bonds), then atom-graph-only layers, mean pooling and a linear head for E_hull."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 def rbf(x: torch.Tensor, lo: float, hi: float, n: int) -> torch.Tensor:
-    """Gaussian expansion of a scalar feature on n centres in [lo, hi]."""
     centres = torch.linspace(lo, hi, n, device=x.device)
     return torch.exp(-((x[:, None] - centres) / ((hi - lo) / (n - 1))) ** 2)
 
@@ -16,8 +13,6 @@ def scatter_sum(src: torch.Tensor, index: torch.Tensor, n: int) -> torch.Tensor:
 
 
 class EdgeGatedConv(nn.Module):
-    """Edge-gated graph convolution (Bresson & Laurent 2017, as in ALIGNN): updates node AND edge features."""
-
     def __init__(self, h: int):
         super().__init__()
         self.src_gate, self.dst_gate, self.edge_gate, self.src_update, self.dst_update = (nn.Linear(h, h)
@@ -42,16 +37,15 @@ class ALIGNN(nn.Module):
                                     for _ in range(n_alignn))
         self.gcn = nn.ModuleList(EdgeGatedConv(hidden) for _ in range(n_gcn))
         self.head = nn.Linear(hidden, 1)
-        self.register_buffer("y_mean", torch.zeros(()))  # standardization of the training labels
+        self.register_buffer("y_mean", torch.zeros(()))
         self.register_buffer("y_std", torch.ones(()))
 
     def forward(self, g: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        """(E_hull in eV/atom, crystal embedding) for a batch from graph.collate."""
         x = self.atom(g["z"])
         y = self.bond(rbf(g["dist"], 0, self.cutoff, self.n_rbf))
         z = self.angle(rbf(g["cos"], -1, 1, self.n_rbf))
         for line_conv, atom_conv in self.alignn:
-            y, z = line_conv(y, g["line_index"], z)  # bonds exchange information through the angles between them
+            y, z = line_conv(y, g["line_index"], z)
             x, y = atom_conv(x, g["edge_index"], y)
         for conv in self.gcn:
             x, y = conv(x, g["edge_index"], y)
