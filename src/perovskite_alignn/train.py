@@ -28,7 +28,9 @@ def load_config(path: str, overrides: list[str]) -> dict:
         *parents, last = key.split(".")
         node = cfg
         for p in parents:
-            node = node[p]
+            node = node.get(p) if isinstance(node, dict) else None
+        if not isinstance(node, dict) or last not in node:
+            raise SystemExit(f"unknown setting {key!r} (see {path})")
         node[last] = yaml.safe_load(raw)
     return cfg
 
@@ -125,7 +127,8 @@ def train_seed(cfg: dict, df: pd.DataFrame, gs: dict, seed: int) -> tuple[ALIGNN
         sched.step()
         val_mae = float(np.mean(np.abs(predict(model, [gs[m] for m in val.material_id], dev) - val.e_hull.values)))
         if val_mae < best:
-            best, best_epoch, best_state = val_mae, epoch, {k: v.clone() for k, v in model.state_dict().items()}
+            best, best_epoch = val_mae, epoch
+            best_state = {name: v.detach().clone() for name, v in model.state_dict().items()}
         if epoch % 10 == 0:
             print(f"seed {seed}  epoch {epoch:3d}  val MAE {val_mae:.4f}  best {best:.4f}", flush=True)
         if epoch - best_epoch >= t["patience"]:
@@ -147,20 +150,25 @@ def train(cfg: dict) -> str:
                out / "model.pt")
     pd.concat([r[1] for r in runs]).to_csv(out / "test_predictions.csv", index=False)
     info = pd.DataFrame([r[2] for r in runs])
+    counts = {"labeled", "training", "best epoch"}
     lines = [f"ALIGNN + graph-Laplacian SSL (weight {t['ssl_weight']}), {len(df)} perovskites, seeds {t['seeds']}, "
              "mean ± sd over seeds (eV/atom for errors)",
-             *(f"{name:<24} {v.mean():.4f} ± {v.std(ddof=0):.4f}" for name, v in info.items())]
+             *(f"{name:<24} {v.mean():.{1 if name in counts else 4}f} ± {v.std(ddof=0):.{1 if name in counts else 4}f}"
+               for name, v in info.items())]
     (out / "report.txt").write_text(text := "\n".join(lines) + "\n")
     return text
 
 
 def predict_files(cfg: dict, inputs: list[str]) -> str:
-    ck = torch.load(Path(cfg["out"]) / "model.pt", weights_only=True)
+    if not (path := Path(cfg["out"]) / "model.pt").exists():
+        raise SystemExit(f"no trained model at {path}: run `perovskite-alignn train` first")
+    ck = torch.load(path, weights_only=True)
     models = [ALIGNN(**ck["model"], cutoff=ck["graph"]["cutoff"]) for _ in ck["states"]]
     for m, state in zip(models, ck["states"]):
         m.load_state_dict(state)
     structs, lines = [], []
-    for f in (f for i in map(Path, inputs) for f in (sorted(i.glob("*.cif")) if i.is_dir() else [i])):
+    files = (f for i in map(Path, inputs) for f in (sorted(i.iterdir()) if i.is_dir() else [i]))
+    for f in (f for f in files if f.suffix.lower() == ".cif"):
         try:
             structs.append((f.name, Structure.from_file(f)))
         except Exception as e:

@@ -36,20 +36,21 @@ def test_perovskite_check():
 def test_prediction_is_invariant_to_rotation_and_atom_order():
     s = Structure.from_str(data.synthetic(1).structure[0], fmt="json")
     rot = Rotation.from_euler("xyz", [30, 50, 10], degrees=True).as_matrix()
+    ideal = SRTIO3.copy().make_supercell([2, 1, 1])
     variants = [s, Structure(s.lattice.matrix @ rot.T, s.species, s.cart_coords @ rot.T, coords_are_cartesian=True),
-                Structure.from_sites([s[i] for i in [3, 1, 4, 0, 2]])]
+                Structure.from_sites([s[i] for i in [3, 1, 4, 0, 2]]), ideal,
+                Structure.from_sites([ideal[i] for i in np.random.default_rng(1).permutation(len(ideal))])]
     torch.manual_seed(0)
     model = ALIGNN(hidden=16).eval()
     with torch.no_grad():
-        p = model(graph.collate([graph.build(v) for v in variants]))[0]
-    assert p.numpy() == pytest.approx(np.full(3, float(p[0])), abs=1e-4)
+        p = model(graph.collate([graph.build(v) for v in variants]))[0].numpy()
+    assert p[:3] == pytest.approx(np.full(3, p[0]), abs=1e-4) and p[4] == pytest.approx(p[3], abs=1e-5)
 
 
 def test_fetch_train_predict_end_to_end(tmp_path, capsys):
     sets = ["--config", str(CONFIG), "--set", "data.source=synthetic", f"data.table={tmp_path}/t.parquet",
             f"data.graphs={tmp_path}/g.pt", f"out={tmp_path}/run", "train.epochs=3", "train.seeds=[0,1]",
-            "train.label_fraction=0.5",
-            "model.hidden=16"]
+            "train.label_fraction=0.5", "model.hidden=16"]
     main(["fetch", *sets])
     main(["train", *sets])
     report = (tmp_path / "run" / "report.txt").read_text()
@@ -62,3 +63,5 @@ def test_fetch_train_predict_end_to_end(tmp_path, capsys):
     main(["predict", str(tmp_path / "SrTiO3.cif"), str(tmp_path / "broken.cif"), *sets])
     out = capsys.readouterr().out
     assert "SrTiO3.cif: SrTiO3  E_hull" in out and " ± " in out and "broken.cif: skipped" in out
+    with pytest.raises(SystemExit, match="unknown setting 'train.epoch'"):
+        main(["train", *sets, "train.epoch=5"])

@@ -3,14 +3,19 @@ import torch
 from pymatgen.core import Structure
 
 
-def build(s: Structure, k: int = 12, cutoff: float = 8.0) -> dict:
+def _bounds(c: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
+    return np.searchsorted(c, np.arange(n), side="left"), np.searchsorted(c, np.arange(n), side="right")
+
+
+def build(s: Structure, k: int = 12, cutoff: float = 8.0, tie_tol: float = 1e-3) -> dict:
     c, p, img, d = s.get_neighbor_list(r=cutoff, exclude_self=True)
     order = np.lexsort((d, c))
     c, p, img, d = c[order], p[order], img[order], d[order]
-    keep = np.arange(len(c)) - np.searchsorted(c, c) < k
+    starts, ends = _bounds(c, len(s))
+    keep = d <= d[np.maximum(np.minimum(starts + k, ends) - 1, 0)][c] + tie_tol
     c, p, img, d = c[keep], p[keep], img[keep], d[keep]
     vec = s.cart_coords[p] + img @ s.lattice.matrix - s.cart_coords[c]
-    starts, ends = (np.searchsorted(c, np.arange(len(s)), side=side) for side in ("left", "right"))
+    starts, ends = _bounds(c, len(s))
     pairs = [np.stack(np.meshgrid(r, r)).reshape(2, -1) for r in (np.arange(a, b) for a, b in zip(starts, ends))]
     ij = np.concatenate(pairs, 1) if pairs else np.zeros((2, 0), int)
     ij = ij[:, ij[0] != ij[1]]

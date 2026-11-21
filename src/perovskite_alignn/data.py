@@ -24,7 +24,8 @@ def fetch(n_max: int, anions: list[str], patterns: list[str], max_sites: int = 6
     df = pd.DataFrame([{"material_id": str(d.material_id), "formula": d.formula_pretty, "e_hull": d.energy_above_hull,
                         "structure": json.dumps(d.structure.as_dict())}
                        for d in docs if d.energy_above_hull is not None])
-    return df.drop_duplicates("material_id").sample(frac=1, random_state=0).head(n_max).reset_index(drop=True)
+    df = df.drop_duplicates("material_id").sort_values("material_id")
+    return df.sample(frac=1, random_state=0).head(n_max).reset_index(drop=True)
 
 
 def is_perovskite(s: Structure, anions: list[str], b_tol: float = 0.25, a_tol: float = 0.4) -> bool:
@@ -45,7 +46,7 @@ def is_perovskite(s: Structure, anions: list[str], b_tol: float = 0.25, a_tol: f
 
 def composition_features(formula: str) -> np.ndarray:
     comp = Composition(formula).fractional_composition
-    P = np.array([[float(getattr(e, p) or 0) for p in PROPS] for e in comp.elements])
+    P = np.nan_to_num(np.array([[float(getattr(e, p) or 0) for p in PROPS] for e in comp.elements]))
     w = np.array([comp[e] for e in comp.elements])[:, None]
     mean = (w * P).sum(0)
     return np.concatenate([mean, np.sqrt((w * (P - mean) ** 2).sum(0))])
