@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perovskite_alignn"
+version = "0.1.0"
+description = "Angle-aware line-graph GNN (ALIGNN-style) with graph-Laplacian SSL for perovskite energy above hull"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.6", "numpy", "pandas", "pyarrow", "scikit-learn", "pymatgen", "mp-api", "pyyaml",
+                "python-dotenv"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+perovskite-alignn = "perovskite_alignn.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = ["B905", "E731"]
